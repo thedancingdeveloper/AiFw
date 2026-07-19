@@ -1,0 +1,36 @@
+name: HA failover qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  two-node:
+    name: CARP, pfsync, and TCP survival
+    runs-on: [self-hosted, freebsd-ha]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Validate inventory
+        env:
+          AIFW_HA_INVENTORY: ${{ secrets.AIFW_HA_INVENTORY }}
+        run: |
+          set -eu
+          test -n "$AIFW_HA_INVENTORY"
+          printf '%s' "$AIFW_HA_INVENTORY" > /tmp/aifw-ha-inventory.json
+          python3 -m json.tool /tmp/aifw-ha-inventory.json >/dev/null
+
+      - name: Exercise controlled failover
+        run: python3 scripts/ha-failover-ci.py /tmp/aifw-ha-inventory.json --results artifacts/ha
+
+      - name: Upload raw HA evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ha-failover-${{ github.sha }}
+          path: artifacts/ha/
+          if-no-files-found: warn
+          retention-days: 30

@@ -1,0 +1,11 @@
+{
+  "node_a": "root@aifw-a",
+  "node_b": "root@aifw-b",
+  "client": "root@ha-client",
+  "server": "root@ha-server",
+  "carp_interface": "vtnet0",
+  "pfsync_interface": "pfsync0",
+  "lan_vip": "192.0.2.1",
+  "server_address": "198.51.100.2",
+  "tcp_port": 18080
+}
