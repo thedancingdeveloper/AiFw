@@ -262,7 +262,7 @@ impl NatEngine {
         #[cfg(not(target_os = "freebsd"))]
         {
             let _ = config;
-            return Ok(());
+            Ok(())
         }
         #[cfg(target_os = "freebsd")]
         {
