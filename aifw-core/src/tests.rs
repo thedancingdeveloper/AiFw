@@ -588,6 +588,36 @@ mod tests {
         assert!(engine.add_rule(rule).await.is_err());
     }
 
+    #[tokio::test]
+    async fn test_nat64_validates_cross_family_before_persistence() {
+        let engine = create_nat_engine().await;
+        let valid = NatRule::new(
+            NatType::Nat64,
+            Interface("em0".to_string()),
+            Protocol::Tcp,
+            Address::Network("2001:db8::".parse().unwrap(), 64),
+            Address::Single("198.51.100.10".parse().unwrap()),
+            NatRedirect {
+                address: Address::Network("192.0.2.0".parse().unwrap(), 24),
+                port: None,
+            },
+        );
+        assert!(engine.add_rule(valid).await.is_ok());
+
+        let invalid = NatRule::new(
+            NatType::Nat64,
+            Interface("em0".to_string()),
+            Protocol::Tcp,
+            Address::Network("10.0.0.0".parse().unwrap(), 24),
+            Address::Single("198.51.100.10".parse().unwrap()),
+            NatRedirect {
+                address: Address::Network("192.0.2.0".parse().unwrap(), 24),
+                port: None,
+            },
+        );
+        assert!(engine.add_rule(invalid).await.is_err());
+    }
+
     // --- Shaping engine tests ---
 
     async fn create_shaping_engine() -> crate::shaping::ShapingEngine {

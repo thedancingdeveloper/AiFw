@@ -362,20 +362,19 @@ mod tests {
     }
 
     #[test]
-    fn test_nat64_pf_rule() {
+    fn test_nat64_is_not_misrendered_as_same_family_pf_nat() {
         let rule = NatRule::new(
             NatType::Nat64,
             Interface("em0".to_string()),
             Protocol::Any,
             Address::Network(IpAddr::V6("64:ff9b::".parse().unwrap()), 96),
-            Address::Any,
+            Address::Single(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))),
             NatRedirect {
                 address: Address::Single(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 0))),
                 port: None,
             },
         );
-        let pf = rule.to_pf_rule();
-        assert!(pf.starts_with("nat on em0 inet6"));
+        assert!(rule.to_pf_rules().is_empty());
     }
 
     // --- Rate limiting / queue tests ---
