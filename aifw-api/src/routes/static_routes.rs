@@ -110,14 +110,16 @@ pub async fn create_static_route(
     .map_err(|_| bad_request())?;
 
     // Apply to system if enabled
-    if enabled {
-        apply_route_to_system(
+    if enabled
+        && let Err(e) = apply_route_to_system(
             &req.destination,
             &req.gateway,
             req.interface.as_deref(),
             fib,
         )
-        .await;
+        .await
+    {
+        tracing::warn!(error = %e, "route create: system apply failed; route remains disabled until startup retry");
     }
 
     let route = StaticRoute {
@@ -169,14 +171,16 @@ pub async fn update_static_route(
     .await
     .map_err(|_| internal())?;
 
-    if enabled {
-        apply_route_to_system(
+    if enabled
+        && let Err(e) = apply_route_to_system(
             &req.destination,
             &req.gateway,
             req.interface.as_deref(),
             fib,
         )
-        .await;
+        .await
+    {
+        tracing::warn!(error = %e, "route update: system apply failed");
     }
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -227,7 +231,7 @@ pub(crate) async fn apply_route_to_system(
     gateway: &str,
     interface: Option<&str>,
     fib: u32,
-) {
+) -> Result<(), String> {
     let fib_s = fib.to_string();
     let mut args: Vec<&str> = Vec::new();
     args.push("/sbin/route");
@@ -249,6 +253,7 @@ pub(crate) async fn apply_route_to_system(
     match output {
         Ok(o) if o.status.success() => {
             tracing::info!(destination, gateway, fib, "route added");
+            Ok(())
         }
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr);
@@ -257,12 +262,15 @@ pub(crate) async fn apply_route_to_system(
             // "route: writing to routing socket: File exists" on FreeBSD.
             if err.contains("File exists") {
                 tracing::debug!(destination, gateway, fib, "route already present, skipping");
+                Ok(())
             } else {
                 tracing::warn!(destination, gateway, fib, error = %err, "route add failed");
+                Err(format!("route add failed: {err}"))
             }
         }
         Err(e) => {
             tracing::warn!(destination, gateway, fib, error = %e, "route command failed");
+            Err(format!("route command failed: {e}"))
         }
     }
 }
@@ -317,6 +325,8 @@ pub async fn apply_all_routes(pool: &sqlx::SqlitePool) {
 
     tracing::info!(count = routes.len(), "applying static routes on startup");
     for (dest, gw, iface, fib) in &routes {
-        apply_route_to_system(dest, gw, iface.as_deref(), *fib as u32).await;
+        if let Err(e) = apply_route_to_system(dest, gw, iface.as_deref(), *fib as u32).await {
+            tracing::warn!(destination = %dest, error = %e, "route startup apply failed");
+        }
     }
 }
