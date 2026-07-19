@@ -831,6 +831,15 @@ mod tests {
         assert!(derive_wg_pubkey("AAAAAAAAAAAAAAAAAAAAAA==").is_err());
     }
 
+    #[test]
+    fn test_validate_wg_key_requires_canonical_32_byte_material() {
+        let (private, public) = generate_wg_keypair().unwrap();
+        assert!(validate_wg_key(&private, "private key").is_ok());
+        assert!(validate_wg_key(&public, "public key").is_ok());
+        assert!(validate_wg_key("not base64", "public key").is_err());
+        assert!(validate_wg_key("AAAAAAAAAAAAAAAAAAAAAA==", "public key").is_err());
+    }
+
     // --- Geo-IP tests ---
 
     #[test]
