@@ -56,6 +56,9 @@ pub enum IdsError {
     /// Alert could not be serialized for an output sink
     #[error("serialization error: {0}")]
     Serialize(#[from] serde_json::Error),
+    /// Reactive-blocking pf rule/table operation failed
+    #[error("pf enforcement error: {0}")]
+    Pf(#[from] aifw_pf::PfError),
 }
 
 /// Crate-wide result alias using [`IdsError`]
@@ -413,10 +416,18 @@ impl IdsEngine {
 
         info!(mode = %self.config.config().mode, "IDS engine starting");
 
+        if self.config.config().mode == IdsMode::Ips {
+            // Reactive blocking is useful only if the table is referenced by
+            // a live rule. Treat failure as a start failure so operators do
+            // not see a running prevention mode that cannot enforce blocks.
+            self.action.ensure_enforcement().await?;
+        }
+
         // Start the alert output consumer. We take the single mpsc receiver
         // out of the engine and move it into the spawn — recv().await blocks
         // until a sender pushes (zero polling, zero idle CPU).
         let pipeline = self.alert_pipeline.clone();
+        let action = self.action.clone();
         let mut rx = self
             .alert_rx
             .lock()
@@ -427,6 +438,21 @@ impl IdsEngine {
         tokio::spawn(async move {
             while let Some(alert) = rx.recv().await {
                 counters.alerts_total.fetch_add(1, Ordering::Relaxed);
+                let verdict = action.verdict(&alert);
+                if matches!(verdict, action::Verdict::Drop | action::Verdict::Reject) {
+                    match action.execute(&alert, &verdict).await {
+                        Ok(()) => {
+                            counters.drops_total.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            error!(
+                                source = %alert.src_ip,
+                                error = %e,
+                                "reactive block apply failed; subsequent traffic is not blocked"
+                            );
+                        }
+                    }
+                }
                 if let Err(e) = pipeline.emit(&alert).await {
                     error!("alert pipeline error: {e}");
                 }

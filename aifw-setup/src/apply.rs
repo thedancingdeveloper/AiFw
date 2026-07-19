@@ -1773,6 +1773,7 @@ pub fn generate_pf_conf(config: &SetupConfig) -> String {
     lines.push("# Tables for overload protection".to_string());
     lines.push("table <bruteforce> persist".to_string());
     lines.push("table <ai_blocked> persist".to_string());
+    lines.push("table <aifw-ids-block> persist".to_string());
     lines.push(String::new());
 
     // Options
@@ -1831,6 +1832,7 @@ pub fn generate_pf_conf(config: &SetupConfig) -> String {
     lines.push("anchor \"aifw-geoip\"".to_string());
     lines.push("anchor \"aifw-tls\"".to_string());
     lines.push("anchor \"aifw-ha\"".to_string());
+    lines.push("anchor \"aifw-ids\"".to_string());
     lines.push(String::new());
 
     // Default policy

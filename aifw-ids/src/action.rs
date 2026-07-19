@@ -2,12 +2,13 @@ use std::sync::Arc;
 
 use aifw_common::ids::{IdsAction, IdsAlert, IdsMode};
 use aifw_pf::PfBackend;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::config::RuntimeConfig;
 
 /// The IDS block table in pf
-const IDS_BLOCK_TABLE: &str = "aifw-ids-block";
+pub(crate) const IDS_BLOCK_TABLE: &str = "aifw-ids-block";
+const IDS_BLOCK_ANCHOR: &str = "aifw-ids";
 
 /// Verdict from the action engine
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +60,22 @@ impl ActionEngine {
     }
 
     /// Execute the verdict — add to pf block table if needed.
-    pub async fn execute(&self, alert: &IdsAlert, verdict: &Verdict) {
+    pub async fn ensure_enforcement(&self) -> crate::Result<()> {
+        self.pf
+            .load_rules(
+                IDS_BLOCK_ANCHOR,
+                &[
+                    format!("block in quick from <{IDS_BLOCK_TABLE}> to any"),
+                    format!("block out quick from <{IDS_BLOCK_TABLE}> to any"),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Apply a reactive verdict. This blocks subsequent packets from the
+    /// source; passive BPF capture cannot stop the triggering packet.
+    pub async fn execute(&self, alert: &IdsAlert, verdict: &Verdict) -> crate::Result<()> {
         match verdict {
             Verdict::Drop | Verdict::Reject => {
                 info!(
@@ -69,26 +85,25 @@ impl ActionEngine {
                     "IPS blocking source"
                 );
 
-                if let Err(e) = self.pf.add_table_entry(IDS_BLOCK_TABLE, alert.src_ip).await {
-                    warn!("failed to add {} to IDS block table: {e}", alert.src_ip);
-                }
+                self.pf
+                    .add_table_entry(IDS_BLOCK_TABLE, alert.src_ip)
+                    .await?;
             }
             _ => {}
         }
+        Ok(())
     }
 
     /// Remove an IP from the IDS block table.
-    pub async fn unblock(&self, ip: std::net::IpAddr) {
-        if let Err(e) = self.pf.remove_table_entry(IDS_BLOCK_TABLE, ip).await {
-            warn!("failed to remove {ip} from IDS block table: {e}");
-        }
+    pub async fn unblock(&self, ip: std::net::IpAddr) -> crate::Result<()> {
+        self.pf.remove_table_entry(IDS_BLOCK_TABLE, ip).await?;
+        Ok(())
     }
 
     /// Flush the IDS block table.
-    pub async fn flush_blocks(&self) {
-        if let Err(e) = self.pf.flush_table(IDS_BLOCK_TABLE).await {
-            warn!("failed to flush IDS block table: {e}");
-        }
+    pub async fn flush_blocks(&self) -> crate::Result<()> {
+        self.pf.flush_table(IDS_BLOCK_TABLE).await?;
+        Ok(())
     }
 }
 
@@ -166,5 +181,38 @@ mod tests {
             Verdict::Alert
         );
         assert_eq!(engine.verdict(&test_alert(IdsAction::Pass)), Verdict::Pass);
+    }
+
+    #[tokio::test]
+    async fn test_reactive_block_lifecycle_ipv4_and_ipv6() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::IdsEngine::migrate(&pool).await.unwrap();
+        let config = Arc::new(RuntimeConfig::load(&pool).await.unwrap());
+        let pf = Arc::new(aifw_pf::PfMock::new());
+        let engine = ActionEngine::new(pf.clone(), config);
+
+        engine.ensure_enforcement().await.unwrap();
+        let rules = pf.get_rules(IDS_BLOCK_ANCHOR).await.unwrap();
+        assert_eq!(rules.len(), 2);
+        assert!(rules.iter().all(|r| r.contains("<aifw-ids-block>")));
+
+        let v4 = test_alert(IdsAction::Drop);
+        engine.execute(&v4, &Verdict::Drop).await.unwrap();
+        let mut v6 = test_alert(IdsAction::Reject);
+        v6.src_ip = "2001:db8::bad".parse().unwrap();
+        engine.execute(&v6, &Verdict::Reject).await.unwrap();
+        let entries = pf.get_table_entries(IDS_BLOCK_TABLE).await.unwrap();
+        assert_eq!(entries.len(), 2);
+
+        engine.unblock(v4.src_ip).await.unwrap();
+        let entries = pf.get_table_entries(IDS_BLOCK_TABLE).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        engine.flush_blocks().await.unwrap();
+        assert!(
+            pf.get_table_entries(IDS_BLOCK_TABLE)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

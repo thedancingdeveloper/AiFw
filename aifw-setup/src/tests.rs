@@ -91,6 +91,8 @@ mod tests {
         assert!(pf.contains("anchor \"aifw\""));
         assert!(pf.contains("table <bruteforce>"));
         assert!(pf.contains("table <ai_blocked>"));
+        assert!(pf.contains("table <aifw-ids-block> persist"));
+        assert!(pf.contains("anchor \"aifw-ids\""));
         assert!(pf.contains("scrub in all"));
         assert!(pf.contains("set skip on lo0"));
         assert!(pf.contains("set skip on pfsync0"));
