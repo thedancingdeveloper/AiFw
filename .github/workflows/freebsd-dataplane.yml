@@ -1,0 +1,38 @@
+name: FreeBSD data plane
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  packet-path:
+    name: pf + live packet path
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Exercise stock FreeBSD kernel data plane
+        uses: vmactions/freebsd-vm@77ed28d336d03fe19a3f4f7266c1d2c4714dd79d # v1.5.2
+        with:
+          release: "15.0"
+          usesh: true
+          copyback: true
+          run: |
+            set -eu
+            cd /home/runner/work/AiFw/AiFw
+            mkdir -p artifacts/freebsd-dataplane
+            AIFW_RESULTS_DIR="$PWD/artifacts/freebsd-dataplane" \
+              sh scripts/freebsd-dataplane-ci.sh
+
+      - name: Upload commands and live kernel state
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: freebsd-dataplane-${{ github.sha }}
+          path: artifacts/freebsd-dataplane/
+          if-no-files-found: error
+          retention-days: 14
