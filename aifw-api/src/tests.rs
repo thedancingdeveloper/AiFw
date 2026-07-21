@@ -1258,6 +1258,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_schedule_rule_association_and_delete_unlink() {
+        let (server, _) = test_app().await;
+        let token = create_user_and_login(&server).await;
+
+        let resp = server
+            .post("/api/v1/schedules")
+            .authorization_bearer(&token)
+            .json(&json!({
+                "name":"overnight",
+                "time_ranges":"22:00-06:00",
+                "days_of_week":"mon,tue,wed,thu,fri"
+            }))
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let body: Value = resp.json();
+        let schedule_id = body["data"]["id"].as_str().unwrap();
+
+        let resp = server
+            .post("/api/v1/rules")
+            .authorization_bearer(&token)
+            .json(&json!({
+                "action":"block",
+                "direction":"in",
+                "protocol":"tcp",
+                "schedule_id":schedule_id
+            }))
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let rule_id = resp.json::<Value>()["data"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let resp = server
+            .get(&format!("/api/v1/rules/{rule_id}"))
+            .authorization_bearer(&token)
+            .await;
+        resp.assert_status_ok();
+        assert_eq!(resp.json::<Value>()["data"]["schedule_id"], schedule_id);
+
+        let resp = server
+            .delete(&format!("/api/v1/schedules/{schedule_id}"))
+            .authorization_bearer(&token)
+            .await;
+        resp.assert_status_ok();
+        let resp = server
+            .get(&format!("/api/v1/rules/{rule_id}"))
+            .authorization_bearer(&token)
+            .await;
+        resp.assert_status_ok();
+        assert!(resp.json::<Value>()["data"]["schedule_id"].is_null());
+    }
+
+    #[tokio::test]
     async fn test_password_validation() {
         let (server, _) = test_app().await;
 

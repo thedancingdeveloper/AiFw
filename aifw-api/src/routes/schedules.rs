@@ -128,6 +128,10 @@ pub async fn create_schedule(
     sqlx::query("INSERT INTO schedules (id, name, description, time_ranges, days_of_week, enabled, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)")
         .bind(&id).bind(&req.name).bind(req.description.as_deref()).bind(&time_ranges).bind(&dow).bind(enabled).bind(&now)
         .execute(&state.pool).await.map_err(|_| bad_request())?;
+    // A rule may already carry this id after a config import or cluster
+    // replication. Creating the referenced schedule can therefore change
+    // its effective state immediately; reload just like update/delete.
+    reapply_rules(&state).await?;
     Ok((
         StatusCode::CREATED,
         Json(ApiResponse {
@@ -186,23 +190,24 @@ pub async fn delete_schedule(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<MessageResponse>, StatusCode> {
+    // Unlink and delete atomically. A dangling reference deliberately fails
+    // open in the compiler, so committing only the DELETE could unexpectedly
+    // activate a rule if the unlink failed.
+    let mut tx = state.pool.begin().await.map_err(|_| internal())?;
     let result = sqlx::query("DELETE FROM schedules WHERE id=?1")
         .bind(&id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|_| internal())?;
     if result.rows_affected() == 0 {
         return Err(StatusCode::NOT_FOUND);
     }
-    // Unlink from rules. On failure the dangling reference fails open in the
-    // engine (rule stays active) — warn so the operator can see why.
-    if let Err(e) = sqlx::query("UPDATE rules SET schedule_id = NULL WHERE schedule_id = ?1")
+    sqlx::query("UPDATE rules SET schedule_id = NULL WHERE schedule_id = ?1")
         .bind(&id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
-    {
-        tracing::warn!(schedule_id = %id, error = %e, "schedule delete: rules unlink failed");
-    }
+        .map_err(|_| internal())?;
+    tx.commit().await.map_err(|_| internal())?;
     reapply_rules(&state).await?;
     Ok(Json(MessageResponse {
         message: format!("Schedule {id} deleted"),
