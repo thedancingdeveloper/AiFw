@@ -146,6 +146,12 @@ impl VpnEngine {
         if tunnel.listen_port == 0 {
             return Err(AifwError::Validation("listen port required".to_string()));
         }
+        let expected_public = aifw_common::vpn::derive_wg_pubkey(&tunnel.private_key)?;
+        if expected_public != tunnel.public_key {
+            return Err(AifwError::Validation(
+                "WireGuard public key does not match private key".to_string(),
+            ));
+        }
 
         // Check for duplicate port (PERF-H5: targeted query, not a full scan).
         if let Some((name,)) = sqlx::query_as::<_, (String,)>(
@@ -222,6 +228,12 @@ impl VpnEngine {
         }
         if tunnel.listen_port == 0 {
             return Err(AifwError::Validation("listen port required".to_string()));
+        }
+        let expected_public = aifw_common::vpn::derive_wg_pubkey(&tunnel.private_key)?;
+        if expected_public != tunnel.public_key {
+            return Err(AifwError::Validation(
+                "WireGuard public key does not match private key".to_string(),
+            ));
         }
 
         // PERF-H5: targeted duplicate-port check, not a full-table scan.
@@ -303,6 +315,17 @@ impl VpnEngine {
         if peer.public_key.is_empty() {
             return Err(AifwError::Validation(
                 "peer public key required".to_string(),
+            ));
+        }
+        aifw_common::vpn::validate_wg_key(&peer.public_key, "peer public key")?;
+        if let Some(psk) = peer.preshared_key.as_deref() {
+            aifw_common::vpn::validate_wg_key(psk, "peer preshared key")?;
+        }
+        if let Some(private) = peer.client_private_key.as_deref()
+            && aifw_common::vpn::derive_wg_pubkey(private)? != peer.public_key
+        {
+            return Err(AifwError::Validation(
+                "peer public key does not match client private key".to_string(),
             ));
         }
         // Verify tunnel exists
@@ -400,6 +423,17 @@ impl VpnEngine {
 
     /// Update a peer's settings; updating an unknown id is silently a no-op
     pub async fn update_wg_peer(&self, peer: &WgPeer) -> Result<()> {
+        aifw_common::vpn::validate_wg_key(&peer.public_key, "peer public key")?;
+        if let Some(psk) = peer.preshared_key.as_deref() {
+            aifw_common::vpn::validate_wg_key(psk, "peer preshared key")?;
+        }
+        if let Some(private) = peer.client_private_key.as_deref()
+            && aifw_common::vpn::derive_wg_pubkey(private)? != peer.public_key
+        {
+            return Err(AifwError::Validation(
+                "peer public key does not match client private key".to_string(),
+            ));
+        }
         let allowed_ips: Vec<String> = peer.allowed_ips.iter().map(|a| a.to_string()).collect();
         sqlx::query(
             r#"

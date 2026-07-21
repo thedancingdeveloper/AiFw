@@ -631,6 +631,16 @@ pub fn derive_wg_pubkey(private_key_b64: &str) -> crate::Result<String> {
     ))
 }
 
+/// Validate one base64-encoded WireGuard key and return its decoded bytes.
+/// WireGuard public, private, and preshared keys are exactly 32 bytes.
+pub fn validate_wg_key(key_b64: &str, kind: &str) -> crate::Result<[u8; 32]> {
+    let bytes = base64_decode(key_b64)
+        .ok_or_else(|| crate::AifwError::Crypto(format!("{kind} is not valid base64")))?;
+    bytes
+        .try_into()
+        .map_err(|_| crate::AifwError::Crypto(format!("{kind} must decode to 32 bytes")))
+}
+
 /// Generate a WireGuard preshared key (32 OS-CSPRNG bytes, base64 encoded).
 /// Fails closed if the OS CSPRNG is unavailable.
 pub fn generate_wg_psk() -> crate::Result<String> {

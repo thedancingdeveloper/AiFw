@@ -840,6 +840,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_wg_tunnel_rejects_mismatched_keypair_before_persistence() {
+        let engine = create_vpn_engine().await;
+        let mut tunnel = WgTunnel::new(
+            "broken".to_string(),
+            Interface("wg0".to_string()),
+            51820,
+            Address::Any,
+        )
+        .unwrap();
+        tunnel.public_key = aifw_common::vpn::generate_wg_keypair().unwrap().1;
+        assert!(engine.add_wg_tunnel(tunnel).await.is_err());
+        assert!(engine.list_wg_tunnels().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_wg_peer_rejects_malformed_public_and_preshared_keys() {
+        let engine = create_vpn_engine().await;
+        let tunnel = WgTunnel::new(
+            "wg0".to_string(),
+            Interface("wg0".to_string()),
+            51820,
+            Address::Any,
+        )
+        .unwrap();
+        let tid = tunnel.id;
+        engine.add_wg_tunnel(tunnel).await.unwrap();
+
+        let malformed = WgPeer::new(tid, "bad-public".to_string(), "not-base64".to_string());
+        assert!(engine.add_wg_peer(malformed).await.is_err());
+
+        let mut malformed_psk = WgPeer::new_with_generated_key(tid, "bad-psk".to_string()).unwrap();
+        malformed_psk.preshared_key = Some("too-short".to_string());
+        assert!(engine.add_wg_peer(malformed_psk).await.is_err());
+        assert!(engine.list_wg_peers(tid).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_wg_peer_crud() {
         let engine = create_vpn_engine().await;
 
@@ -856,7 +893,7 @@ mod tests {
         let tid = tunnel.id;
         engine.add_wg_tunnel(tunnel).await.unwrap();
 
-        let mut peer = WgPeer::new(tid, "laptop".to_string(), "fakepubkey123".to_string());
+        let mut peer = WgPeer::new_with_generated_key(tid, "laptop".to_string()).unwrap();
         peer.endpoint = Some("1.2.3.4:51820".to_string());
         peer.allowed_ips = vec![Address::Network(
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
@@ -900,17 +937,18 @@ mod tests {
         engine.add_wg_tunnel(t1).await.unwrap();
         engine.add_wg_tunnel(t2).await.unwrap();
 
-        let peer = |tid, name: &str, pk: &str, last: u8| {
-            let mut p = WgPeer::new(tid, name.to_string(), pk.to_string());
+        let peer = |tid, name: &str, last: u8| {
+            let (_, public) = aifw_common::vpn::generate_wg_keypair().unwrap();
+            let mut p = WgPeer::new(tid, name.to_string(), public);
             p.allowed_ips = vec![Address::Network(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, last)),
                 32,
             )];
             p
         };
-        engine.add_wg_peer(peer(id1, "a", "pubA", 2)).await.unwrap();
-        engine.add_wg_peer(peer(id1, "b", "pubB", 3)).await.unwrap();
-        engine.add_wg_peer(peer(id2, "c", "pubC", 4)).await.unwrap();
+        engine.add_wg_peer(peer(id1, "a", 2)).await.unwrap();
+        engine.add_wg_peer(peer(id1, "b", 3)).await.unwrap();
+        engine.add_wg_peer(peer(id2, "c", 4)).await.unwrap();
 
         let grouped = engine.list_all_wg_peers_grouped().await.unwrap();
         assert_eq!(grouped.get(&id1).map(|v| v.len()), Some(2));
