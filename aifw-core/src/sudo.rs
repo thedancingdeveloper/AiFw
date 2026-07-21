@@ -80,6 +80,18 @@ const HELPER_CP: &str = "/usr/local/libexec/aifw-sudo-cp";
 const HELPER_TAR: &str = "/usr/local/libexec/aifw-sudo-tar";
 const HELPER_TCPDUMP: &str = "/usr/local/libexec/aifw-sudo-tcpdump";
 const HELPER_SWANCTL: &str = "/usr/local/libexec/aifw-sudo-swanctl";
+const HELPER_NATX: &str = "/usr/local/libexec/aifw-sudo-natx";
+/// Apply a validated Jool cross-family translation configuration.
+pub async fn natx_apply(config: &[u8]) -> std::io::Result<()> {
+    let output = run_with_stdin_pipe(&[HELPER_NATX], config).await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ))
+    }
+}
 
 /// Atomically write `contents` to `path`, as root, via the
 /// `aifw-sudo-write` helper script.

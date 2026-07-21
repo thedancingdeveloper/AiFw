@@ -156,8 +156,9 @@ impl NatRule {
             }
             NatType::Masquerade => vec![self.to_pf_masquerade()],
             NatType::Binat => vec![self.to_pf_binat()],
-            NatType::Nat64 => vec![self.to_pf_nat64()],
-            NatType::Nat46 => vec![self.to_pf_nat46()],
+            // Cross-family translation is implemented by the NAT engine's
+            // stateful translator backend, not by pf's same-family `nat`.
+            NatType::Nat64 | NatType::Nat46 => Vec::new(),
         }
     }
 
@@ -224,26 +225,6 @@ impl NatRule {
     /// `binat on <iface> from <src> to <dst> -> <redirect>`
     fn to_pf_binat(&self) -> String {
         let mut parts = vec![format!("binat on {}", self.interface)];
-        self.push_proto(&mut parts);
-        self.push_from_to(&mut parts);
-        parts.push(format!("-> {}", self.redirect));
-        self.push_label(&mut parts);
-        parts.join(" ")
-    }
-
-    /// NAT64: `nat on <iface> inet6 from <src> to <dst> -> <redirect>`
-    fn to_pf_nat64(&self) -> String {
-        let mut parts = vec![format!("nat on {} inet6", self.interface)];
-        self.push_proto(&mut parts);
-        self.push_from_to(&mut parts);
-        parts.push(format!("-> {}", self.redirect));
-        self.push_label(&mut parts);
-        parts.join(" ")
-    }
-
-    /// NAT46: `nat on <iface> inet from <src> to <dst> -> <redirect>`
-    fn to_pf_nat46(&self) -> String {
-        let mut parts = vec![format!("nat on {} inet", self.interface)];
         self.push_proto(&mut parts);
         self.push_from_to(&mut parts);
         parts.push(format!("-> {}", self.redirect));

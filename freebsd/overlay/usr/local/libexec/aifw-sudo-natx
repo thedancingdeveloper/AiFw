@@ -1,0 +1,20 @@
+#!/bin/sh
+# Transactional boundary for the Jool translator micro-VM controller.
+set -eu
+[ $# -eq 0 ] || { echo "usage: $0" >&2; exit 2; }
+CONTROL=/usr/local/libexec/aifw-natx-control
+[ -x "$CONTROL" ] || { echo "NAT64/NAT46 translator controller is not installed" >&2; exit 1; }
+NEW=$(mktemp /tmp/aifw-natx.XXXXXX)
+OLD=$(mktemp /tmp/aifw-natx-old.XXXXXX)
+CONF=/usr/local/etc/aifw/natx.json
+trap 'rm -f "$NEW" "$OLD"' EXIT INT TERM HUP
+cat >"$NEW"
+python3 -m json.tool "$NEW" >/dev/null
+if [ -f "$CONF" ]; then cp "$CONF" "$OLD"; else : >"$OLD"; fi
+install -m 600 -o root -g wheel "$NEW" "$CONF"
+if ! "$CONTROL" apply "$CONF" || ! "$CONTROL" verify "$CONF"; then
+    if [ -s "$OLD" ]; then install -m 600 -o root -g wheel "$OLD" "$CONF"; else rm -f "$CONF"; fi
+    "$CONTROL" apply "$CONF" >/dev/null 2>&1 || true
+    echo "translator apply/verify failed; previous state restored" >&2
+    exit 1
+fi

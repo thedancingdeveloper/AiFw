@@ -223,6 +223,10 @@ impl NatEngine {
     pub async fn apply_rules(&self) -> Result<()> {
         let rules = self.list_active_rules().await?;
         let pf_rules: Vec<String> = rules.iter().flat_map(|r| r.to_pf_rules()).collect();
+        let cross_family: Vec<&NatRule> = rules
+            .iter()
+            .filter(|r| matches!(r.nat_type, NatType::Nat64 | NatType::Nat46))
+            .collect();
 
         tracing::info!(
             anchor = %self.anchor,
@@ -234,6 +238,8 @@ impl NatEngine {
             .load_nat_rules(&self.anchor, &pf_rules)
             .await
             .map_err(|e| AifwError::Pf(e.to_string()))?;
+
+        self.apply_cross_family(&cross_family).await?;
 
         self.audit
             .log(
@@ -249,6 +255,26 @@ impl NatEngine {
             .await?;
 
         Ok(())
+    }
+
+    async fn apply_cross_family(&self, rules: &[&NatRule]) -> Result<()> {
+        let config = render_jool_config(rules)?;
+        #[cfg(not(target_os = "freebsd"))]
+        {
+            let _ = config;
+            Ok(())
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            // Jool provides a real stateful RFC 6146 translator. It runs in
+            // a bhyve Linux micro-VM on FreeBSD and exposes a pair of tap
+            // interfaces; the closed privileged helper owns VM lifecycle,
+            // atomically swaps config, verifies both instances, and rolls
+            // back on failure.
+            crate::sudo::natx_apply(config.as_bytes())
+                .await
+                .map_err(|e| AifwError::Other(format!("cross-family NAT apply failed: {e}")))
+        }
     }
 
     /// Flush all NAT rules from the pf anchor and record an audit entry.
@@ -326,12 +352,73 @@ fn validate_nat_rule(rule: &NatRule) -> Result<()> {
         ));
     }
 
+    validate_cross_family(rule)?;
+
     // Masquerade redirect is the interface itself, no address needed
     if rule.nat_type == NatType::Masquerade && rule.redirect.address != Address::Any {
         // This is fine — we'll ignore the redirect address and use the interface
     }
 
     Ok(())
+}
+
+fn address_family(address: &Address) -> Option<u8> {
+    match address {
+        Address::Single(std::net::IpAddr::V4(_)) | Address::Network(std::net::IpAddr::V4(_), _) => {
+            Some(4)
+        }
+        Address::Single(std::net::IpAddr::V6(_)) | Address::Network(std::net::IpAddr::V6(_), _) => {
+            Some(6)
+        }
+        _ => None,
+    }
+}
+
+fn validate_cross_family(rule: &NatRule) -> Result<()> {
+    let expected = match rule.nat_type {
+        NatType::Nat64 => Some((6, 4)),
+        NatType::Nat46 => Some((4, 6)),
+        _ => None,
+    };
+    let Some((source, target)) = expected else {
+        return Ok(());
+    };
+    if address_family(&rule.src_addr) != Some(source)
+        || address_family(&rule.dst_addr) != Some(target)
+        || address_family(&rule.redirect.address) != Some(target)
+    {
+        return Err(AifwError::Validation(format!(
+            "{} requires IPv{} source and IPv{} destination/pool",
+            rule.nat_type, source, target
+        )));
+    }
+    if rule.src_port.is_some() || rule.dst_port.is_some() || rule.redirect.port.is_some() {
+        return Err(AifwError::Validation(
+            "cross-family translation preserves ports; port remapping is unsupported".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn render_jool_config(rules: &[&NatRule]) -> Result<String> {
+    let mut out = String::from("{\n  \"instances\": [\n");
+    for (index, rule) in rules.iter().enumerate() {
+        validate_cross_family(rule)?;
+        if index > 0 {
+            out.push_str(",\n");
+        }
+        let framework = if rule.nat_type == NatType::Nat64 {
+            "netfilter"
+        } else {
+            "iptables"
+        };
+        out.push_str(&format!(
+            "    {{\"name\":\"aifw-{}\",\"type\":\"{}\",\"framework\":\"{}\",\"interface\":\"{}\",\"source\":\"{}\",\"destination\":\"{}\",\"pool\":\"{}\"}}",
+            rule.id, rule.nat_type, framework, rule.interface, rule.src_addr, rule.dst_addr, rule.redirect.address
+        ));
+    }
+    out.push_str("\n  ]\n}\n");
+    Ok(out)
 }
 
 /// Explicit column list for `NatRuleRow` selects, in schema order. Replaces
