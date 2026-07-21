@@ -1511,6 +1511,109 @@ fn apply_fail(step: &str, e: impl std::fmt::Display) -> StatusCode {
     StatusCode::INTERNAL_SERVER_ERROR
 }
 
+/// Render and validate every required target resource before the first
+/// destructive DELETE. Older restore code discovered malformed rows halfway
+/// through apply and silently skipped them, making rollback the normal
+/// validation path and allowing partial-success responses.
+fn validate_restore_target(
+    config: &FirewallConfig,
+    iface_map: &InterfaceMap,
+) -> Result<(), StatusCode> {
+    use aifw_common::{Address, AliasType, CountryCode};
+
+    for rule in &config.rules {
+        if rule
+            .interface
+            .as_deref()
+            .is_some_and(|name| map_iface(name, iface_map).is_none())
+        {
+            continue;
+        }
+        rule_from_config(rule)
+            .ok_or_else(|| apply_fail(&format!("validating rule {}", rule.id), "invalid rule"))?;
+    }
+    for nat in &config.nat {
+        if map_iface(&nat.interface, iface_map).is_none() {
+            continue;
+        }
+        nat_from_config(nat).ok_or_else(|| {
+            apply_fail(
+                &format!("validating nat rule {}", nat.id),
+                "invalid NAT rule",
+            )
+        })?;
+    }
+    for alias in &config.aliases {
+        AliasType::parse(&alias.alias_type).ok_or_else(|| {
+            apply_fail(
+                &format!("validating alias {}", alias.name),
+                "invalid alias type",
+            )
+        })?;
+    }
+    for route in &config.static_routes {
+        crate::routes::validate_route_target(&route.destination).map_err(|_| {
+            apply_fail(
+                &format!("validating route {}", route.destination),
+                "invalid destination",
+            )
+        })?;
+        crate::routes::validate_route_target(&route.gateway).map_err(|_| {
+            apply_fail(
+                &format!("validating route {}", route.destination),
+                "invalid gateway",
+            )
+        })?;
+    }
+    for geo in &config.geoip {
+        CountryCode::new(&geo.country)
+            .map_err(|e| apply_fail(&format!("validating geo-ip {}", geo.id), e))?;
+    }
+    for tunnel in &config.vpn.wireguard {
+        if map_iface(&tunnel.interface, iface_map).is_none() {
+            continue;
+        }
+        Address::parse(&tunnel.address)
+            .map_err(|e| apply_fail(&format!("validating wireguard {}", tunnel.name), e))?;
+        for peer in &tunnel.peers {
+            for address in &peer.allowed_ips {
+                Address::parse(address).map_err(|e| {
+                    apply_fail(&format!("validating wireguard peer {}", peer.name), e)
+                })?;
+            }
+        }
+    }
+    for sa in &config.vpn.ipsec {
+        Address::parse(&sa.src_addr)
+            .map_err(|e| apply_fail(&format!("validating ipsec {}", sa.name), e))?;
+        Address::parse(&sa.dst_addr)
+            .map_err(|e| apply_fail(&format!("validating ipsec {}", sa.name), e))?;
+    }
+    for queue in &config.queues {
+        if map_iface(&queue.interface, iface_map).is_none() {
+            continue;
+        }
+        queue_from_config(queue).ok_or_else(|| {
+            apply_fail(
+                &format!("validating shaping queue {}", queue.name),
+                "invalid queue",
+            )
+        })?;
+    }
+    for limit in &config.rate_limits {
+        if limit
+            .interface
+            .as_deref()
+            .is_some_and(|name| map_iface(name, iface_map).is_none())
+        {
+            continue;
+        }
+        rate_limit_from_config(limit)
+            .ok_or_else(|| apply_fail("validating rate limit", "invalid rate limit"))?;
+    }
+    Ok(())
+}
+
 /// Restore-with-rollback wrapper around [`apply_firewall_config`] (#535).
 ///
 /// Captures the current running config first, applies the target strictly,
@@ -1529,6 +1632,7 @@ pub(crate) async fn apply_firewall_config_or_rollback(
     config: &FirewallConfig,
     iface_map: &InterfaceMap,
 ) -> Result<(), StatusCode> {
+    validate_restore_target(config, iface_map)?;
     let snapshot = build_current_config(state).await?;
     let Err(apply_err) = apply_firewall_config(state, config, iface_map).await else {
         return Ok(());
@@ -1579,6 +1683,8 @@ pub(crate) async fn apply_firewall_config(
     use aifw_common::{
         Address, CountryCode, GeoIpRule, Interface, IpsecSa, VpnStatus, WgPeer, WgTunnel,
     };
+
+    validate_restore_target(config, iface_map)?;
 
     // Restore preludes — clear existing rows before re-populating from the
     // imported config. A failed DELETE (locked DB, FK violation, schema
@@ -1707,7 +1813,8 @@ pub(crate) async fn apply_firewall_config(
                 iface_after.as_deref(),
                 rc.fib,
             )
-            .await;
+            .await
+            .map_err(|e| apply_fail(&format!("static route {} apply", rc.destination), e))?;
         }
     }
 

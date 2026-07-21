@@ -1504,7 +1504,11 @@ async fn apply_routes(
                 // Attempt to program the kernel route. Mirrors what
                 // `routes::create_static_route` does for a single-route
                 // creation request.
-                crate::routes::apply_route_to_system(&r.network, gateway, None, 0).await;
+                if let Err(e) =
+                    crate::routes::apply_route_to_system(&r.network, gateway, None, 0).await
+                {
+                    tracing::warn!(error = %e, "opnsense import: route apply failed");
+                }
                 tracker.static_route_ids.push(id);
                 summary.static_routes += 1;
             }

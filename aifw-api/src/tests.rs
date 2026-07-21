@@ -2296,6 +2296,38 @@ mod tests {
         assert!(res.is_err(), "partial apply must not report success");
     }
 
+    #[tokio::test]
+    async fn test_restore_preflight_rejects_invalid_target_without_mutation() {
+        let state = crate::create_app_state_in_memory(plain_auth_settings())
+            .await
+            .unwrap();
+        let mut existing = aifw_common::Rule::new(
+            aifw_common::Action::Block,
+            aifw_common::Direction::In,
+            aifw_common::Protocol::Tcp,
+            aifw_common::RuleMatch {
+                src_addr: aifw_common::Address::Any,
+                src_port: None,
+                dst_addr: aifw_common::Address::Any,
+                dst_port: None,
+            },
+        );
+        existing.label = Some("must-survive-preflight".into());
+        let existing_id = existing.id;
+        state.rule_engine.add_rule(existing).await.unwrap();
+
+        let mut config = crate::backup::build_current_config(&state).await.unwrap();
+        config.rules[0].src_addr = Some("definitely-not-an-address".into());
+        let res =
+            crate::backup::apply_firewall_config_or_rollback(&state, &config, &Default::default())
+                .await;
+        assert!(res.is_err());
+        assert!(
+            state.rule_engine.get_rule(existing_id).await.is_ok(),
+            "preflight failure must happen before destructive table clears"
+        );
+    }
+
     // --- IPsec tunnels (#530) ---
 
     fn ipsec_tunnel_body() -> Value {
