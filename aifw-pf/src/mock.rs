@@ -18,6 +18,7 @@ pub struct PfMock {
     running: RwLock<bool>,
     iface_fibs: RwLock<HashMap<String, u32>>,
     fib_count: RwLock<u32>,
+    armed_failures: RwLock<std::collections::HashSet<String>>,
 }
 
 impl PfMock {
@@ -32,7 +33,27 @@ impl PfMock {
             running: RwLock::new(true),
             iface_fibs: RwLock::new(HashMap::new()),
             fib_count: RwLock::new(1),
+            armed_failures: RwLock::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Arm a persistent injected failure for the named backend operation
+    /// (e.g. `"load_rules"`); every call to that op fails until
+    /// [`Self::clear_fail`]. Test helper for #535 failure-injection suites.
+    pub async fn fail_op(&self, op: &str) {
+        self.armed_failures.write().await.insert(op.to_string());
+    }
+
+    /// Disarm an injected failure set by [`Self::fail_op`].
+    pub async fn clear_fail(&self, op: &str) {
+        self.armed_failures.write().await.remove(op);
+    }
+
+    async fn check_fail(&self, op: &str) -> Result<(), PfError> {
+        if self.armed_failures.read().await.contains(op) {
+            return Err(PfError::Other(format!("injected failure: {op}")));
+        }
+        Ok(())
     }
 
     /// Override the number of available FIBs for testing multi-WAN scenarios.
@@ -59,7 +80,16 @@ impl Default for PfMock {
 
 #[async_trait]
 impl PfBackend for PfMock {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn echoes_exact_rules(&self) -> bool {
+        true
+    }
+
     async fn add_rule(&self, anchor: &str, rule: &str) -> Result<(), PfError> {
+        self.check_fail("add_rule").await?;
         tracing::debug!(anchor, rule, "mock: add_rule");
         let mut rules = self.rules.write().await;
         rules
@@ -70,6 +100,7 @@ impl PfBackend for PfMock {
     }
 
     async fn flush_rules(&self, anchor: &str) -> Result<(), PfError> {
+        self.check_fail("flush_rules").await?;
         tracing::debug!(anchor, "mock: flush_rules");
         let mut rules = self.rules.write().await;
         rules.remove(anchor);
@@ -77,6 +108,7 @@ impl PfBackend for PfMock {
     }
 
     async fn load_rules(&self, anchor: &str, new_rules: &[String]) -> Result<(), PfError> {
+        self.check_fail("load_rules").await?;
         tracing::debug!(anchor, count = new_rules.len(), "mock: load_rules");
         let mut rules = self.rules.write().await;
         rules.insert(anchor.to_string(), new_rules.to_vec());
@@ -84,6 +116,7 @@ impl PfBackend for PfMock {
     }
 
     async fn get_rules(&self, anchor: &str) -> Result<Vec<String>, PfError> {
+        self.check_fail("get_rules").await?;
         let rules = self.rules.read().await;
         Ok(rules.get(anchor).cloned().unwrap_or_default())
     }
@@ -105,6 +138,7 @@ impl PfBackend for PfMock {
     }
 
     async fn add_table_entry(&self, table: &str, addr: IpAddr) -> Result<(), PfError> {
+        self.check_fail("add_table_entry").await?;
         tracing::debug!(%addr, table, "mock: add_table_entry");
         let mut tables = self.tables.write().await;
         let entries = tables.entry(table.to_string()).or_default();
@@ -119,6 +153,7 @@ impl PfBackend for PfMock {
         table: &str,
         entries: &[(IpAddr, u8)],
     ) -> Result<(), PfError> {
+        self.check_fail("replace_table_entries").await?;
         tracing::debug!(table, count = entries.len(), "mock: replace_table_entries");
         let mut tables = self.tables.write().await;
         // Mock only tracks bare addresses, not prefixes — match the existing
@@ -131,6 +166,7 @@ impl PfBackend for PfMock {
     }
 
     async fn remove_table_entry(&self, table: &str, addr: IpAddr) -> Result<(), PfError> {
+        self.check_fail("remove_table_entry").await?;
         tracing::debug!(%addr, table, "mock: remove_table_entry");
         let mut tables = self.tables.write().await;
         if let Some(entries) = tables.get_mut(table) {
@@ -140,6 +176,7 @@ impl PfBackend for PfMock {
     }
 
     async fn flush_table(&self, table: &str) -> Result<(), PfError> {
+        self.check_fail("flush_table").await?;
         tracing::debug!(table, "mock: flush_table");
         let mut tables = self.tables.write().await;
         tables.remove(table);
@@ -165,25 +202,46 @@ impl PfBackend for PfMock {
     }
 
     async fn load_nat_rules(&self, anchor: &str, rules: &[String]) -> Result<(), PfError> {
+        self.check_fail("load_nat_rules").await?;
         tracing::debug!(anchor, count = rules.len(), "mock: load_nat_rules");
-        let mut nat_rules = self.nat_rules.write().await;
-        nat_rules.insert(anchor.to_string(), rules.to_vec());
+        // Mirror real pf semantics (#531): a plain `-f` load replaces every
+        // rule class in the anchor. nat-class lines land in the nat ruleset
+        // (`-sn`), filter-class lines (af-to pass rules) in the filter
+        // ruleset (`-sr`).
+        let (nat_class, filter_class): (Vec<String>, Vec<String>) =
+            rules.iter().cloned().partition(|r| {
+                ["nat ", "rdr ", "binat ", "nat-anchor", "rdr-anchor"]
+                    .iter()
+                    .any(|p| r.starts_with(p))
+            });
+        self.nat_rules
+            .write()
+            .await
+            .insert(anchor.to_string(), nat_class);
+        self.rules
+            .write()
+            .await
+            .insert(anchor.to_string(), filter_class);
         Ok(())
     }
 
     async fn get_nat_rules(&self, anchor: &str) -> Result<Vec<String>, PfError> {
+        self.check_fail("get_nat_rules").await?;
         let nat_rules = self.nat_rules.read().await;
         Ok(nat_rules.get(anchor).cloned().unwrap_or_default())
     }
 
     async fn flush_nat_rules(&self, anchor: &str) -> Result<(), PfError> {
+        self.check_fail("flush_nat_rules").await?;
         tracing::debug!(anchor, "mock: flush_nat_rules");
-        let mut nat_rules = self.nat_rules.write().await;
-        nat_rules.remove(anchor);
+        // Both classes, matching PfIoctl (-Fn + -Fr) — see load_nat_rules.
+        self.nat_rules.write().await.remove(anchor);
+        self.rules.write().await.remove(anchor);
         Ok(())
     }
 
     async fn load_queues(&self, anchor: &str, queue_defs: &[String]) -> Result<(), PfError> {
+        self.check_fail("load_queues").await?;
         tracing::debug!(anchor, count = queue_defs.len(), "mock: load_queues");
         let mut queues = self.queues.write().await;
         queues.insert(anchor.to_string(), queue_defs.to_vec());
@@ -196,6 +254,7 @@ impl PfBackend for PfMock {
     }
 
     async fn flush_queues(&self, anchor: &str) -> Result<(), PfError> {
+        self.check_fail("flush_queues").await?;
         tracing::debug!(anchor, "mock: flush_queues");
         let mut queues = self.queues.write().await;
         queues.remove(anchor);

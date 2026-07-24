@@ -442,6 +442,73 @@ mod tests {
         resp.assert_status_ok();
     }
 
+    #[tokio::test]
+    async fn test_nat64_create_happy_path() {
+        let (server, _) = test_app().await;
+        let token = create_user_and_login(&server).await;
+
+        let resp = server
+            .post("/api/v1/nat")
+            .authorization_bearer(&token)
+            .json(&json!({
+                "nat_type": "nat64",
+                "interface": "em0",
+                "protocol": "any",
+                "src_addr": "2001:db8:1::/64",
+                "dst_addr": "64:ff9b::/96",
+                "redirect_addr": "203.0.113.1",
+            }))
+            .await;
+
+        resp.assert_status(StatusCode::CREATED);
+        let body: Value = resp.json();
+        assert_eq!(body["data"]["nat_type"], "nat64");
+    }
+
+    #[tokio::test]
+    async fn test_nat64_create_wrong_family_gets_message() {
+        let (server, _) = test_app().await;
+        let token = create_user_and_login(&server).await;
+
+        // IPv4 redirect required for nat64 — an IPv6 one must 400 with a
+        // human-readable message (surfaced to the UI banner, #531).
+        let resp = server
+            .post("/api/v1/nat")
+            .authorization_bearer(&token)
+            .json(&json!({
+                "nat_type": "nat64",
+                "interface": "em0",
+                "protocol": "any",
+                "dst_addr": "64:ff9b::/96",
+                "redirect_addr": "2001:db8::1",
+            }))
+            .await;
+
+        resp.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = resp.json();
+        let msg = body["message"].as_str().unwrap();
+        assert!(
+            msg.contains("nat64"),
+            "message should name the rule type: {msg}"
+        );
+
+        // Missing /96 prefix on the destination
+        let resp = server
+            .post("/api/v1/nat")
+            .authorization_bearer(&token)
+            .json(&json!({
+                "nat_type": "nat64",
+                "interface": "em0",
+                "protocol": "any",
+                "dst_addr": "64:ff9b::/64",
+                "redirect_addr": "203.0.113.1",
+            }))
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = resp.json();
+        assert!(body["message"].as_str().unwrap().contains("/96"));
+    }
+
     // --- New auth system tests ---
 
     #[tokio::test]
@@ -2280,6 +2347,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_restore_round_trips_dns_resolver_config() {
+        // #589: resolver settings live in dns_resolver_config, not
+        // /etc/resolv.conf — a backup/restore must carry them.
+        let state = crate::create_app_state_in_memory(plain_auth_settings())
+            .await
+            .unwrap();
+
+        let resolver = crate::dns_resolver::ResolverConfig {
+            forwarding_servers: vec!["9.9.9.9".to_string()],
+            blocklists_enabled: true,
+            ..Default::default()
+        };
+        let mut conn = state.pool.acquire().await.unwrap();
+        crate::dns_resolver::save_config_on(&mut conn, &resolver)
+            .await
+            .unwrap();
+        drop(conn);
+
+        let config = crate::backup::build_current_config(&state).await.unwrap();
+        let exported = config
+            .dns_resolver
+            .as_ref()
+            .expect("export must include resolver");
+        assert_eq!(exported.forwarding_servers, vec!["9.9.9.9".to_string()]);
+        assert!(exported.blocklists_enabled);
+
+        // Simulate drift after the backup was taken.
+        sqlx::query(
+            "INSERT OR REPLACE INTO dns_resolver_config (key, value) VALUES ('forwarding_servers', '8.8.4.4')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        crate::backup::apply_firewall_config(&state, &config, &Default::default())
+            .await
+            .expect("restore must succeed");
+
+        let (servers,): (String,) = sqlx::query_as(
+            "SELECT value FROM dns_resolver_config WHERE key = 'forwarding_servers'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            servers, "9.9.9.9",
+            "restore must reinstate the backed-up forwarders"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_without_resolver_section_leaves_config_untouched() {
+        // A pre-#589 backup has no dns_resolver section — restoring it must
+        // not reset the box's resolver config to defaults.
+        let state = crate::create_app_state_in_memory(plain_auth_settings())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT OR REPLACE INTO dns_resolver_config (key, value) VALUES ('forwarding_servers', '9.9.9.9')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let mut config = crate::backup::build_current_config(&state).await.unwrap();
+        config.dns_resolver = None;
+        crate::backup::apply_firewall_config(&state, &config, &Default::default())
+            .await
+            .expect("restore must succeed");
+
+        let (servers,): (String,) = sqlx::query_as(
+            "SELECT value FROM dns_resolver_config WHERE key = 'forwarding_servers'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            servers, "9.9.9.9",
+            "legacy restore must not clobber resolver config"
+        );
+    }
+
+    #[tokio::test]
     async fn test_restore_fails_instead_of_partial_apply() {
         // A required step failing (here: clearing a table that no longer
         // exists) must abort the restore with an error, never return Ok after
@@ -2294,6 +2444,397 @@ mod tests {
             .unwrap();
         let res = crate::backup::apply_firewall_config(&state, &config, &Default::default()).await;
         assert!(res.is_err(), "partial apply must not report success");
+    }
+
+    #[tokio::test]
+    async fn test_mid_apply_failure_rolls_back_db_transaction() {
+        // Force a failure LATE in the apply (the DHCP clear runs after every
+        // rules/NAT/alias insert) and verify the single restore transaction
+        // (#158) rewinds everything — the pre-restore rows must survive
+        // untouched even without the snapshot-reapply wrapper.
+        let state = crate::create_app_state_in_memory(plain_auth_settings())
+            .await
+            .unwrap();
+        let rule = aifw_common::Rule::new(
+            aifw_common::Action::Pass,
+            aifw_common::Direction::In,
+            aifw_common::Protocol::Tcp,
+            aifw_common::RuleMatch {
+                src_addr: aifw_common::Address::Any,
+                src_port: None,
+                dst_addr: aifw_common::Address::Any,
+                dst_port: None,
+            },
+        );
+        let rule_id = state.rule_engine.add_rule(rule).await.unwrap().id;
+
+        let config = crate::backup::build_current_config(&state).await.unwrap();
+        sqlx::query("DROP TABLE dhcp_subnets")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let res = crate::backup::apply_firewall_config(&state, &config, &Default::default()).await;
+        assert!(res.is_err(), "late failure must abort the restore");
+
+        let rules = state.rule_engine.list_rules().await.unwrap();
+        assert_eq!(rules.len(), 1, "transaction rollback must keep prior rows");
+        assert_eq!(rules[0].id, rule_id);
+    }
+
+    #[tokio::test]
+    async fn test_restore_1k_rules_round_trips() {
+        // #158 acceptance: a large config restores through the single
+        // transaction and every row survives the round trip.
+        let state = crate::create_app_state_in_memory(plain_auth_settings())
+            .await
+            .unwrap();
+        let mut config = crate::backup::build_current_config(&state).await.unwrap();
+        for i in 0..1000 {
+            config.rules.push(aifw_core::config::RuleConfig {
+                id: uuid::Uuid::new_v4().to_string(),
+                priority: i,
+                action: aifw_common::Action::Pass,
+                direction: aifw_common::Direction::In,
+                protocol: aifw_common::Protocol::Tcp,
+                interface: None,
+                src_addr: Some("any".to_string()),
+                src_port_start: None,
+                src_port_end: None,
+                dst_addr: Some("any".to_string()),
+                dst_port_start: Some(1000 + i as u16),
+                dst_port_end: Some(1000 + i as u16),
+                log: false,
+                quick: true,
+                label: Some(format!("bulk-{i}")),
+                state_tracking: aifw_common::StateTracking::KeepState,
+                status: aifw_common::RuleStatus::Active,
+                ip_version: aifw_common::IpVersion::Both,
+                src_invert: false,
+                dst_invert: false,
+                schedule_id: None,
+                gateway: None,
+            });
+        }
+        let started = std::time::Instant::now();
+        crate::backup::apply_firewall_config(&state, &config, &Default::default())
+            .await
+            .expect("bulk restore must succeed");
+        let elapsed = started.elapsed();
+        let rules = state.rule_engine.list_rules().await.unwrap();
+        assert_eq!(rules.len(), 1000, "every rule must survive the round trip");
+        // Generous bound — the point is one transaction, not per-row fsyncs.
+        assert!(elapsed.as_secs() < 30, "bulk restore took {elapsed:?}");
+    }
+
+    fn any_tcp_rule() -> aifw_common::Rule {
+        aifw_common::Rule::new(
+            aifw_common::Action::Pass,
+            aifw_common::Direction::In,
+            aifw_common::Protocol::Tcp,
+            aifw_common::RuleMatch {
+                src_addr: aifw_common::Address::Any,
+                src_port: None,
+                dst_addr: aifw_common::Address::Any,
+                dst_port: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn test_restore_failure_injection_every_db_stage() {
+        // #535: for every table the restore touches, a failure at that stage
+        // must abort the restore with the transaction rolled back — the
+        // pre-restore rules must survive untouched at every injection point.
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .try_init();
+        for table in [
+            "nat_rules",
+            "aliases",
+            "static_routes",
+            "geoip_rules",
+            "wg_tunnels",
+            "wg_peers",
+            "ipsec_sas",
+            "ipsec_tunnels",
+            "queue_configs",
+            "rate_limit_rules",
+            "sni_rules",
+            "ja3_blocklist",
+            "carp_vips",
+            "pfsync_config",
+            "cluster_nodes",
+            "auth_config",
+            "dhcp_subnets",
+            "dhcp_reservations",
+            "dhcp_config",
+            "dhcp_ddns_config",
+            "dhcp_ha_config",
+        ] {
+            let state = crate::create_app_state_in_memory(plain_auth_settings())
+                .await
+                .unwrap();
+            state.rule_engine.add_rule(any_tcp_rule()).await.unwrap();
+            let config = crate::backup::build_current_config(&state).await.unwrap();
+            // Replace the table with a read-only VIEW of the same name: the
+            // engine migrates' CREATE TABLE IF NOT EXISTS no-op on it (so
+            // pre-tx migrates can't undo the injection, unlike a plain DROP)
+            // and the restore's DELETE/INSERT then fails at exactly this
+            // stage.
+            sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE VIEW {table} AS SELECT 1 AS x"
+            )))
+            .execute(&state.pool)
+            .await
+            .unwrap();
+            let res =
+                crate::backup::apply_firewall_config(&state, &config, &Default::default()).await;
+            assert!(res.is_err(), "failure at {table} must abort the restore");
+            let rules = state.rule_engine.list_rules().await.unwrap();
+            assert_eq!(
+                rules.len(),
+                1,
+                "failure at {table} must leave prior rules untouched"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_mid_tx_failure_rolls_back_and_audits() {
+        // Outcome 2 of the #535 contract: apply fails (duplicate alias name
+        // violates the UNIQUE constraint mid-transaction), prior state is
+        // restored, and the rollback is audited.
+        let state = crate::create_app_state_in_memory(plain_auth_settings())
+            .await
+            .unwrap();
+        state.rule_engine.add_rule(any_tcp_rule()).await.unwrap();
+        state
+            .alias_engine
+            .add(aifw_common::Alias {
+                id: uuid::Uuid::new_v4(),
+                name: "keepme".to_string(),
+                alias_type: aifw_common::AliasType::Host,
+                entries: vec!["192.0.2.1".to_string()],
+                description: None,
+                enabled: true,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let mut config = crate::backup::build_current_config(&state).await.unwrap();
+        for _ in 0..2 {
+            config.aliases.push(aifw_core::config::AliasConfig {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "dup_name".to_string(),
+                alias_type: "host".to_string(),
+                entries: vec!["198.51.100.1".to_string()],
+                description: None,
+                enabled: false,
+            });
+        }
+
+        let res =
+            crate::backup::apply_firewall_config_or_rollback(&state, &config, &Default::default())
+                .await;
+        assert!(res.is_err(), "duplicate alias must abort the restore");
+
+        let aliases = state.alias_engine.list().await.unwrap();
+        assert_eq!(aliases.len(), 1, "prior alias set must be restored");
+        assert_eq!(aliases[0].name, "keepme");
+        assert_eq!(state.rule_engine.list_rules().await.unwrap().len(), 1);
+
+        let (audits,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM audit_log WHERE details LIKE '%rolled back to pre-restore state%'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert!(audits >= 1, "rollback must be audited");
+    }
+
+    #[tokio::test]
+    async fn test_restore_pf_failure_after_commit_rolls_back_cleanly() {
+        // Outcome 2 via the data plane: the target config needs a pf op the
+        // snapshot doesn't (geo-IP table populate), so injecting that
+        // failure aborts the target apply and the snapshot re-applies clean.
+        let state = crate::create_app_state_in_memory(plain_auth_settings())
+            .await
+            .unwrap();
+        state.rule_engine.add_rule(any_tcp_rule()).await.unwrap();
+        let mock = state
+            .pf
+            .as_any()
+            .downcast_ref::<aifw_pf::PfMock>()
+            .expect("tests run on the mock backend");
+        mock.fail_op("replace_table_entries").await;
+
+        let mut config = crate::backup::build_current_config(&state).await.unwrap();
+        config.geoip.push(aifw_core::config::GeoIpEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            country: "CN".to_string(),
+            action: aifw_common::GeoIpAction::Block,
+            label: None,
+            status: aifw_common::GeoIpRuleStatus::Active,
+        });
+
+        let res =
+            crate::backup::apply_firewall_config_or_rollback(&state, &config, &Default::default())
+                .await;
+        assert!(res.is_err(), "pf failure must abort the restore");
+        assert_eq!(
+            state.geoip_engine.list_rules().await.unwrap().len(),
+            0,
+            "geo-ip rows from the failed target must be rolled back"
+        );
+        assert_eq!(state.rule_engine.list_rules().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_restore_rollback_failure_is_audited_high_severity() {
+        // Outcome 3 of the #535 contract: the apply fails AND the rollback
+        // fails (persistent pf failure hits both); the operator gets an
+        // explicit rollback-failed audit row, never silent partial success.
+        let state = crate::create_app_state_in_memory(plain_auth_settings())
+            .await
+            .unwrap();
+        state.rule_engine.add_rule(any_tcp_rule()).await.unwrap();
+        let mock = state
+            .pf
+            .as_any()
+            .downcast_ref::<aifw_pf::PfMock>()
+            .expect("tests run on the mock backend");
+        mock.fail_op("load_rules").await;
+
+        let config = crate::backup::build_current_config(&state).await.unwrap();
+        let res =
+            crate::backup::apply_firewall_config_or_rollback(&state, &config, &Default::default())
+                .await;
+        assert!(res.is_err());
+
+        let (audits,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM audit_log WHERE details LIKE '%rollback failed%'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(audits >= 1, "failed rollback must be audited");
+        mock.clear_fail("load_rules").await;
+    }
+
+    #[tokio::test]
+    async fn test_commit_confirm_refuses_invalid_rollback_snapshot() {
+        // Arming with a snapshot that can't roll back would leave the timer
+        // to fail silently at expiry (#535) — it must be refused up front.
+        let state = crate::create_app_state_in_memory(plain_auth_settings())
+            .await
+            .unwrap();
+        let res = crate::backup::commit_confirm_arm_with_snapshot(
+            state,
+            "{not valid json".to_string(),
+            "test".to_string(),
+            5,
+        )
+        .await;
+        assert_eq!(res, Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[tokio::test]
+    async fn test_post_apply_verification_detects_pf_drift() {
+        // verify_applied must fail when the pf anchor no longer matches the
+        // database (#535 post-apply verification).
+        let state = crate::create_app_state_in_memory(plain_auth_settings())
+            .await
+            .unwrap();
+        let rule = aifw_common::Rule::new(
+            aifw_common::Action::Pass,
+            aifw_common::Direction::In,
+            aifw_common::Protocol::Tcp,
+            aifw_common::RuleMatch {
+                src_addr: aifw_common::Address::Any,
+                src_port: None,
+                dst_addr: aifw_common::Address::Any,
+                dst_port: None,
+            },
+        );
+        state.rule_engine.add_rule(rule).await.unwrap();
+        state.rule_engine.apply_rules().await.unwrap();
+        state
+            .rule_engine
+            .verify_applied()
+            .await
+            .expect("freshly applied ruleset must verify");
+
+        state.pf.flush_rules("aifw").await.unwrap();
+        assert!(
+            state.rule_engine.verify_applied().await.is_err(),
+            "flushed anchor must fail verification"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prevalidation_rejects_bad_config_without_mutation() {
+        // A config that would abort mid-apply (rule priority out of range)
+        // must be rejected up front with 400 and zero rows touched (#535).
+        let state = crate::create_app_state_in_memory(plain_auth_settings())
+            .await
+            .unwrap();
+        let rule = aifw_common::Rule::new(
+            aifw_common::Action::Pass,
+            aifw_common::Direction::In,
+            aifw_common::Protocol::Tcp,
+            aifw_common::RuleMatch {
+                src_addr: aifw_common::Address::Any,
+                src_port: None,
+                dst_addr: aifw_common::Address::Any,
+                dst_port: None,
+            },
+        );
+        state.rule_engine.add_rule(rule).await.unwrap();
+
+        let mut config = crate::backup::build_current_config(&state).await.unwrap();
+        config.rules[0].priority = 20_000; // validate_rule caps at 10000
+
+        let res =
+            crate::backup::apply_firewall_config_or_rollback(&state, &config, &Default::default())
+                .await;
+        assert_eq!(res, Err(axum::http::StatusCode::BAD_REQUEST));
+        let rules = state.rule_engine.list_rules().await.unwrap();
+        assert_eq!(rules.len(), 1, "prevalidation failure must not touch rows");
+    }
+
+    #[tokio::test]
+    async fn test_prevalidation_rejects_duplicate_wg_ports() {
+        let state = crate::create_app_state_in_memory(plain_auth_settings())
+            .await
+            .unwrap();
+        let mut config = crate::backup::build_current_config(&state).await.unwrap();
+        for name in ["wg-a", "wg-b"] {
+            config
+                .vpn
+                .wireguard
+                .push(aifw_core::config::WireguardTunnelConfig {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: name.to_string(),
+                    interface: "wg0".to_string(),
+                    listen_port: 51820,
+                    address: "10.9.0.1/24".to_string(),
+                    address6: None,
+                    private_key: "k".into(),
+                    public_key: "K".into(),
+                    dns: None,
+                    mtu: None,
+                    peers: vec![],
+                });
+        }
+        let res =
+            crate::backup::apply_firewall_config_or_rollback(&state, &config, &Default::default())
+                .await;
+        assert_eq!(res, Err(axum::http::StatusCode::BAD_REQUEST));
     }
 
     // --- IPsec tunnels (#530) ---
@@ -2444,5 +2985,207 @@ mod tests {
                 .unwrap()
                 .starts_with("aifw-")
         );
+    }
+
+    // ============ Session-cookie auth (SEC-M7 #304) ============
+
+    /// Collect the `Set-Cookie` header values from a response.
+    fn set_cookies(resp: &axum_test::TestResponse) -> Vec<String> {
+        resp.headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_string))
+            .collect()
+    }
+
+    /// Extract `<name>=<value>` (value only) from a `Set-Cookie` list.
+    fn cookie_from(cookies: &[String], name: &str) -> String {
+        cookies
+            .iter()
+            .find(|c| c.starts_with(&format!("{name}=")))
+            .and_then(|c| c.split(';').next())
+            .and_then(|kv| kv.split('=').nth(1))
+            .unwrap_or_else(|| panic!("cookie {name} not found in {cookies:?}"))
+            .to_string()
+    }
+
+    /// Register the first user and log in, returning the raw `Set-Cookie`
+    /// values from the login response.
+    async fn login_cookies(server: &TestServer) -> Vec<String> {
+        server
+            .post("/api/v1/auth/register")
+            .json(&json!({"username": "admin", "password": "TestPass123"}))
+            .await;
+        let resp = server
+            .post("/api/v1/auth/login")
+            .json(&json!({"username": "admin", "password": "TestPass123"}))
+            .await;
+        resp.assert_status_ok();
+        set_cookies(&resp)
+    }
+
+    #[tokio::test]
+    async fn test_login_sets_httponly_session_cookies() {
+        let (server, _) = test_app().await;
+        let cookies = login_cookies(&server).await;
+
+        assert_eq!(cookies.len(), 2, "expected access + refresh cookies");
+        for c in &cookies {
+            assert!(c.contains("HttpOnly"), "{c}");
+            assert!(c.contains("SameSite=Strict"), "{c}");
+        }
+        let access = cookies.iter().find(|c| c.starts_with("aifw_at=")).unwrap();
+        assert!(access.contains("Path=/;"), "{access}");
+        let refresh = cookies.iter().find(|c| c.starts_with("aifw_rt=")).unwrap();
+        assert!(refresh.contains("Path=/api/v1/auth;"), "{refresh}");
+    }
+
+    #[tokio::test]
+    async fn test_cookie_authenticates_requests() {
+        let (server, _) = test_app().await;
+        let cookies = login_cookies(&server).await;
+        let access = cookie_from(&cookies, "aifw_at");
+
+        // No Authorization header — the cookie alone must authenticate.
+        let resp = server
+            .get("/api/v1/auth/me")
+            .add_header("cookie", format!("aifw_at={access}"))
+            .await;
+        resp.assert_status_ok();
+        let body: Value = resp.json();
+        assert_eq!(body["username"], "admin");
+    }
+
+    #[tokio::test]
+    async fn test_cookie_write_requires_csrf_header() {
+        let (server, _) = test_app().await;
+        let cookies = login_cookies(&server).await;
+        let access = cookie_from(&cookies, "aifw_at");
+
+        // Unsafe method with cookie auth but no CSRF header → 403.
+        let resp = server
+            .post("/api/v1/auth/ws-ticket")
+            .add_header("cookie", format!("aifw_at={access}"))
+            .await;
+        resp.assert_status(StatusCode::FORBIDDEN);
+
+        // Same request with the custom header succeeds.
+        let resp = server
+            .post("/api/v1/auth/ws-ticket")
+            .add_header("cookie", format!("aifw_at={access}"))
+            .add_header("x-aifw-csrf", "1")
+            .await;
+        resp.assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn test_bearer_writes_do_not_need_csrf_header() {
+        let (server, _) = test_app().await;
+        let token = create_user_and_login(&server).await;
+
+        // Header-auth clients are CSRF-immune; no custom header required.
+        let resp = server
+            .post("/api/v1/auth/ws-ticket")
+            .authorization_bearer(&token)
+            .await;
+        resp.assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn test_refresh_via_cookie_rotates_session() {
+        let (server, _) = test_app().await;
+        let cookies = login_cookies(&server).await;
+        let refresh = cookie_from(&cookies, "aifw_rt");
+
+        // No JSON body — the refresh token rides the cookie.
+        let resp = server
+            .post("/api/v1/auth/refresh")
+            .add_header("cookie", format!("aifw_rt={refresh}"))
+            .await;
+        resp.assert_status_ok();
+
+        let rotated = set_cookies(&resp);
+        let new_access = cookie_from(&rotated, "aifw_at");
+        let new_refresh = cookie_from(&rotated, "aifw_rt");
+        assert_ne!(new_refresh, refresh, "refresh token must rotate");
+
+        // The rotated access cookie authenticates.
+        server
+            .get("/api/v1/auth/me")
+            .add_header("cookie", format!("aifw_at={new_access}"))
+            .await
+            .assert_status_ok();
+
+        // The old refresh token was revoked by the rotation.
+        let resp = server
+            .post("/api/v1/auth/refresh")
+            .add_header("cookie", format!("aifw_rt={refresh}"))
+            .await;
+        resp.assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_logout_via_cookies_clears_and_revokes() {
+        let (server, _) = test_app().await;
+        let cookies = login_cookies(&server).await;
+        let access = cookie_from(&cookies, "aifw_at");
+        let refresh = cookie_from(&cookies, "aifw_rt");
+
+        // Cookie-only logout: no body, no Authorization header.
+        let resp = server
+            .post("/api/v1/auth/logout")
+            .add_header("cookie", format!("aifw_at={access}; aifw_rt={refresh}"))
+            .add_header("x-aifw-csrf", "1")
+            .await;
+        resp.assert_status_ok();
+        for c in set_cookies(&resp) {
+            assert!(c.contains("Max-Age=0"), "logout must expire cookies: {c}");
+        }
+
+        // Access token was revoked (JTI) — cookie no longer authenticates.
+        let resp = server
+            .get("/api/v1/auth/me")
+            .add_header("cookie", format!("aifw_at={access}"))
+            .await;
+        resp.assert_status(StatusCode::UNAUTHORIZED);
+
+        // Refresh token was revoked too.
+        let resp = server
+            .post("/api/v1/auth/refresh")
+            .add_header("cookie", format!("aifw_rt={refresh}"))
+            .await;
+        resp.assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_totp_required_login_sets_no_cookies() {
+        let (server, _) = test_app().await;
+        // First login normally to create the user, then enable TOTP.
+        let token = create_user_and_login(&server).await;
+        let resp = server
+            .post("/api/v1/auth/totp/setup")
+            .authorization_bearer(&token)
+            .await;
+        resp.assert_status_ok();
+        let body: Value = resp.json();
+        let secret = body["secret"].as_str().unwrap().to_string();
+        let code = crate::auth::totp::generate_current(&secret).unwrap();
+        server
+            .post("/api/v1/auth/totp/verify")
+            .authorization_bearer(&token)
+            .json(&json!({"code": code}))
+            .await
+            .assert_status_ok();
+
+        // Password-only login now returns totp_required and must NOT install
+        // session cookies.
+        let resp = server
+            .post("/api/v1/auth/login")
+            .json(&json!({"username": "admin", "password": "TestPass123"}))
+            .await;
+        resp.assert_status_ok();
+        let body: Value = resp.json();
+        assert_eq!(body["totp_required"], true);
+        assert!(set_cookies(&resp).is_empty(), "no cookies before 2FA");
     }
 }

@@ -80,6 +80,19 @@ const HELPER_CP: &str = "/usr/local/libexec/aifw-sudo-cp";
 const HELPER_TAR: &str = "/usr/local/libexec/aifw-sudo-tar";
 const HELPER_TCPDUMP: &str = "/usr/local/libexec/aifw-sudo-tcpdump";
 const HELPER_SWANCTL: &str = "/usr/local/libexec/aifw-sudo-swanctl";
+const HELPER_DUMMYNET: &str = "/usr/local/libexec/aifw-sudo-dummynet";
+/// Apply dummynet/FQ-CoDel commands through the closed helper.
+pub async fn dummynet_apply(commands: &[String]) -> std::io::Result<()> {
+    let payload = commands.join("\n");
+    let output = run_with_stdin_pipe(&[HELPER_DUMMYNET], payload.as_bytes()).await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ))
+    }
+}
 
 /// Atomically write `contents` to `path`, as root, via the
 /// `aifw-sudo-write` helper script.
@@ -398,4 +411,31 @@ pub async fn tcpdump(args: &[&str]) -> std::io::Result<std::process::Output> {
     let mut fallback: Vec<&str> = vec!["/usr/sbin/tcpdump"];
     fallback.extend_from_slice(args);
     sudo_with_fallback(&narrow, &fallback).await
+}
+
+#[cfg(test)]
+mod allowlist_tests {
+    /// Guard (#601): every path the code writes through `aifw-sudo-write`
+    /// must appear in the helper's allowlist. `pf.conf.aifw` was missing,
+    /// so pf-tuning's boot apply failed silently on every appliance —
+    /// the same drift family as the sudoers guard in aifw-setup.
+    #[test]
+    fn sudo_write_allowlist_covers_call_sites() {
+        let helper = include_str!("../../freebsd/overlay/usr/local/libexec/aifw-sudo-write");
+        for path in [
+            "/etc/pf.conf",
+            "/usr/local/etc/aifw/pf.conf.aifw",
+            "/usr/local/etc/trafficcop/config.yaml",
+            "/usr/local/etc/aifw/daemon.key",
+            "/usr/local/etc/swanctl/conf.d/aifw-*.conf",
+            "/usr/local/etc/swanctl/private/aifw-*.pem",
+            "/usr/local/etc/swanctl/x509/aifw-*.pem",
+            "/usr/local/etc/swanctl/x509ca/aifw-*.pem",
+        ] {
+            assert!(
+                helper.contains(path),
+                "aifw-sudo-write allowlist is missing {path} — runtime writes to it are refused"
+            );
+        }
+    }
 }

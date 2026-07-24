@@ -12,8 +12,8 @@ ARCH="${2:-amd64}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-FREEBSD_VERSION="15.0"
-FREEBSD_RELEASE="15.0-RELEASE"
+FREEBSD_VERSION="15.1"
+FREEBSD_RELEASE="15.1-RELEASE"
 FREEBSD_MIRROR="https://download.freebsd.org/releases/${ARCH}/${FREEBSD_RELEASE}"
 
 WORKDIR="/usr/obj/aifw-iso"
@@ -113,7 +113,7 @@ cp /etc/resolv.conf "$STAGEDIR/etc/resolv.conf"
 # Bootstrap pkg and install required packages
 chroot "$STAGEDIR" /bin/sh -c '
     env ASSUME_ALWAYS_YES=yes pkg bootstrap -f
-    pkg install -y wireguard-tools sudo unbound curl strongswan
+    pkg install -y wireguard-tools sudo unbound curl strongswan minisign
 '
 
 umount "$STAGEDIR/dev"
